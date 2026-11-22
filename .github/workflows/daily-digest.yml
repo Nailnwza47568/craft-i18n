@@ -49,7 +49,8 @@ jobs:
               printf '%s' "$json" | jq -c --argjson n "$n" \
                 '{n:$n, state:.state, merged:(.merged // false), mergeable:.mergeable,
                   comments:.comments, title:.title, author:.user.login}' > one.json
-              jq -s 'add' state.json one.json > tmp.json && mv tmp.json state.json
+              jq -c -s '.[0] + [.[1]]' state.json one.json > tmp.json
+              mv tmp.json state.json
             fi
           done
 
