@@ -121,17 +121,15 @@ jobs:
           fi
           echo "news lines: $(grep -c '^  •' news.txt || true)"
 
-      - name: Mail it only when there is something
+      - name: Mail the summary
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: rachatasawasdikit@gmail.com
         run: |
           set -euo pipefail
-          if [ ! -s news.txt ]; then
-            echo "ไม่มีอะไรเกิดขึ้น — ไม่ส่งเมล"
-            exit 0
-          fi
+          quiet=0
+          if [ ! -s news.txt ]; then quiet=1; fi
 
           today=$(TZ=Asia/Bangkok date '+%Y-%m-%d')
           n=$(grep -c '^  •' news.txt || true)
@@ -139,12 +137,29 @@ jobs:
           {
             echo "From: $SMTP_USER"
             echo "To: $MAIL_TO"
-            echo "Subject: [craft-i18n TH] $today — มีอะไรเกิดขึ้น $n เรื่อง"
+            if [ "$quiet" = "1" ]; then
+              echo "Subject: [craft-i18n TH] $today — ไม่มีอะไรใหม่"
+            else
+              echo "Subject: [craft-i18n TH] $today — มีอะไรเกิดขึ้น $n เรื่อง"
+            fi
             echo "Content-Type: text/plain; charset=UTF-8"
             echo
-            echo "มีความเคลื่อนไหวเกี่ยวกับงานภาษาไทย craft-i18n"
-            echo
-            cat news.txt
+            if [ "$quiet" = "1" ]; then
+              echo "ไม่มีอะไรใหม่ — PR ทั้งหมดยังนิ่งเหมือนเมื่อวาน"
+              echo
+              echo "สถานะล่าสุด:"
+              jq -r '.[] | "  #\(.n)  \(if .merged then "✅ merged" elif .state == "open" then "เปิดอยู่" else .state end)  · คอมเมนต์ \(.comments)  · \(.title)"' state.json 2>/dev/null || true
+              echo
+              echo "แคตตาล็อกภาษาไทยบน main:"
+              for f in locales/th/wordcraft.tsv locales/th/craft-launcher.tsv; do
+                s=$(jq -r --arg f "$f" '.[$f] // "absent"' files.json)
+                if [ "$s" = "absent" ]; then echo "  ⬜ ${f#locales/th/} — ยังไม่อยู่"; else echo "  ✅ ${f#locales/th/} — อยู่แล้ว"; fi
+              done
+            else
+              echo "มีความเคลื่อนไหวเกี่ยวกับงานภาษาไทย craft-i18n"
+              echo
+              cat news.txt
+            fi
             echo
             if [ -s quotes.txt ]; then
               echo "─────────────────────"
@@ -157,7 +172,7 @@ jobs:
             echo "PR หลัก: https://github.com/storytold/craft-i18n/pull/340"
             echo "PR คู่แข่ง: https://github.com/storytold/craft-i18n/pull/213"
             echo
-            echo "ถ้าวันไหนไม่มีอะไรเกิดขึ้น จะไม่มีเมลนี้"
+            echo "ส่งจาก GitHub Actions ทุกเช้า 06:30 (เวลาไทย)"
           } > mail.txt
 
           cat mail.txt
