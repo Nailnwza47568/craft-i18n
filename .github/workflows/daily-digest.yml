@@ -1,15 +1,15 @@
 name: Daily PR digest
 
-# Mails a Thai summary of the Thai pull requests every morning from GitHub's servers,
-# so the recipient's computer does not need to be on.
+# Mails a short Thai note every morning ONLY when something actually happened:
+# a pull request merged, the Thai catalogs landed on main, a new comment, a state change.
+# On a quiet day it sends nothing at all (no "nothing new" mail).
+#
+# Runs on GitHub's servers, so the recipient's computer can stay off.
 #
 # Secrets (Settings → Secrets and variables → Actions):
 #   SMTP_USER  the Gmail address that sends (rachatasawasdikit@gmail.com)
 #   SMTP_PASS  that account's Google App Password
 # MAIL_TO is fixed below: rachatasawasdikit@gmail.com
-#
-# Yesterday's state is kept in the `pr-state` artifact, so the mail can say what changed.
-# The job only reads pull requests and sends one mail; it never writes to the repository.
 
 on:
   schedule:
@@ -27,7 +27,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Yesterday's state (best effort)
-        id: yday
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
         with:
@@ -36,7 +35,7 @@ jobs:
           path: prev
           if_no_artifact_found: ignore
 
-      - name: Collect the pull requests
+      - name: Notice what changed
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -48,102 +47,119 @@ jobs:
           for n in 340 341 342 213 180; do
             if json=$(curl -fsS "${auth[@]}" "$api/pulls/$n"); then
               printf '%s' "$json" | jq -c --argjson n "$n" \
-                '{n:$n, state:.state, merged:.merged, mergeable:.mergeable,
-                  author:.user.login, comments:.comments, updated:.updated_at, title:.title}' > one.json
+                '{n:$n, state:.state, merged:(.merged // false), mergeable:.mergeable,
+                  comments:.comments, title:.title, author:.user.login}' > one.json
               jq -s 'add' state.json one.json > tmp.json && mv tmp.json state.json
             fi
           done
 
-          # newest comments on the two PRs that matter
-          : > comments.txt
-          for n in 340 213; do
-            curl -fsS "${auth[@]}" "$api/issues/$n/comments?per_page=2&direction=desc" 2>/dev/null \
-              | jq -r --arg n "$n" '.[] | "#\($n) — \(.user.login) — \(.created_at[0:16] | sub("T"; " "))\n\(.body | split("\n") | map(select((length > 0) and (startswith("<!--") | not))) | .[0:5] | join("\n"))\n"' \
-              >> comments.txt || true
-          done
-
-          # are the Thai catalogs on main yet?
-          : > onmain.txt
+          # the catalogs, and the exact commit they would arrive in
+          echo '{}' > files.json
           for f in locales/th/wordcraft.tsv locales/th/craft-launcher.tsv; do
-            code=$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" "$api/contents/$f")
-            if [ "$code" = "200" ]; then echo "  ✅ ${f#locales/th/} — อยู่บน main แล้ว" >> onmain.txt
-            else echo "  ⬜ ${f#locales/th/} — ยังไม่อยู่บน main" >> onmain.txt; fi
+            body=$(curl -fsS "${auth[@]}" "$api/contents/$f" 2>/dev/null || echo '{}')
+            printf '%s' "$body" | jq --arg f "$f" '{"\($f)": (.sha // "absent")}' > f1.json
+            jq -s 'add' files.json f1.json > f2.json && mv f2.json files.json
           done
 
-      - name: Write the mail
-        env:
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-        run: |
-          set -euo pipefail
-          today=$(TZ=Asia/Bangkok date '+%Y-%m-%d')
-          prev='prev/state.json'
+          prev_state='prev/state.json'
+          prev_files='prev/files.json'
+          [ -f "$prev_state" ] || echo '[]' > prev_state.fallback
+          [ -f "$prev_files" ] || echo '{}' > prev_files.fallback
+          [ -f "$prev_state" ] || prev_state='prev_state.fallback'
+          [ -f "$prev_files" ] || prev_files='prev_files.fallback'
 
-          # what changed since yesterday (a PR absent from yesterday counts as changed)
-          jq -n --slurpfile now state.json --slurpfile prev "$prev" '
-            ($prev[0] // []) as $p
-            | ($now[0]) as $n
-            | [ $n[] | . as $x
-                | ($p | map(select(.n == $x.n)) | .[0]) as $o
-                | select($o == null
-                         or $o.state != $x.state
-                         or $o.merged != $x.merged
-                         or $o.mergeable != $x.mergeable
-                         or $o.comments != $x.comments)
-                | if $o == null
-                  then "  • #\($x.n) — ใหม่: \($x.state) · คู่แข่ง/PR เกี่ยวข้อง"
-                  else "  • #\($x.n) — \($o.state) → \($x.state) · mergeable \($o.mergeable) → \($x.mergeable) · คอมเมนต์ \($o.comments) → \($x.comments)"
-                  end ]
-          ' > changed.txt 2>/dev/null || echo "  (เทียบกับเมื่อวานไม่ได้)" > changed.txt
+          # ---- the only two kinds of news we mail about --------------------------------
+          : > news.txt
+          add() { echo "  • $*" >> news.txt; }
 
-          n_change=$(grep -c '^  •' changed.txt || true)
-          if [ "$n_change" -gt 0 ]; then
-            subject="[craft-i18n TH] $today — มีอะไรเกิดขึ้น ${n_change} เรื่อง"
-          else
-            subject="[craft-i18n TH] $today — ไม่มีอะไรใหม่"
+          # 1) the Thai catalogs are on main (and this is new)
+          for f in locales/th/wordcraft.tsv locales/th/craft-launcher.tsv; do
+            now=$(jq -r --arg f "$f" '.[$f] // "absent"' files.json)
+            was=$(jq -r --arg f "$f" '.[$f] // "absent"' "$prev_files")
+            if [ "$now" != "absent" ] && [ "$was" = "absent" ]; then
+              add "🎉 **${f#locales/th/} ถูกนำไปใช้แล้ว** — อยู่บน main ของ storytold/craft-i18n"
+            fi
+          done
+
+          # 2) a pull request went from open to merged
+          jq -r --slurpfile prev "$prev_state" '
+            .[] | . as $x
+            | ($prev[0] | map(select(.n == $x.n)) | .[0]) as $o
+            | select($x.merged and ($o != null) and ($o.merged | not))
+            | "🎉 **#\($x.n) ถูก merge แล้ว** — \($x.title)"' state.json | while read -r l; do add "$l"; done
+
+          # 3) a closed pull request was reopened
+          jq -r --slurpfile prev "$prev_state" '
+            .[] | . as $x
+            | ($prev[0] | map(select(.n == $x.n)) | .[0]) as $o
+            | select($o != null and $o.state == "closed" and $x.state == "open")
+            | "🔄 #\($x.n) ถูกเปิดใหม่ — \($x.title)"' state.json | while read -r l; do add "$l"; done
+
+          # 4) new comments (count went up)
+          jq -r --slurpfile prev "$prev_state" '
+            .[] | . as $x
+            | ($prev[0] | map(select(.n == $x.n)) | .[0]) as $o
+            | select($o != null and $x.comments > $o.comments)
+            | "💬 #\($x.n) มีคอมเมนต์ใหม่ \($x.comments - $o.comments) รายการ (รวม \($x.comments))"' \
+            state.json | while read -r l; do add "$l"; done
+
+          # 5) a PR that did not exist yesterday
+          jq -r --slurpfile prev "$prev_state" '
+            .[] | . as $x
+            | select(($prev[0] | map(select(.n == $x.n))) | length == 0)
+            | "🆕 #\($x.n) เพิ่งเปิด — \($x.title)"' state.json | while read -r l; do add "$l"; done
+
+          # 6) what the newest comments actually say (only when there is news)
+          : > quotes.txt
+          if [ -s news.txt ]; then
+            for n in 340 213; do
+              curl -fsS "${auth[@]}" "$api/issues/$n/comments?per_page=1&direction=desc" 2>/dev/null \
+                | jq -r --arg n "$n" '.[] | "── #\($n) · \(.user.login) · \(.created_at[0:16] | sub("T"; " "))\n\(.body | split("\n") | map(select((length > 0) and (startswith("<!--") | not) and (startswith(">") | not))) | .[0:4] | join("\n"))"' \
+                >> quotes.txt || true
+            done
           fi
+          echo "news lines: $(grep -c '^  •' news.txt || true)"
 
-          {
-            echo "Subject: $subject"
-            echo "Content-Type: text/plain; charset=UTF-8"
-            echo
-            echo "สรุปสถานะ PR ภาษาไทย craft-i18n — $today (เวลาไทย 06:30)"
-            echo
-            echo "======================================================="
-            if [ "$n_change" -gt 0 ]; then echo "★ มีอะไรเกิดขึ้นเมื่อวานนี้"; else echo "★ ไม่มีอะไรใหม่"; fi
-            echo "======================================================="
-            if [ "$n_change" -gt 0 ]; then cat changed.txt; else echo "  PR ยังนิ่งเหมือนเมื่อวาน ไม่มีคนตอบ ไม่มี merge"; fi
-            echo
-            echo "======================================================="
-            echo "■ สถานะปัจจุบัน"
-            echo "======================================================="
-            jq -r '.[] | "  #\(.n)  \(.state)\(if .merged then " ✅ merged" else "" end)  mergeable=\(.mergeable)  โดย \(.author)  คอมเมนต์=\(.comments)\n        \(.title)"' state.json
-            echo
-            echo "======================================================="
-            echo "■ แคตตาล็อกภาษาไทยบน main (storytold/craft-i18n)"
-            echo "======================================================="
-            cat onmain.txt
-            echo
-            echo "======================================================="
-            echo "■ คอมเมนต์ล่าสุด"
-            echo "======================================================="
-            head -c 3500 comments.txt 2>/dev/null || echo "  (ไม่มี)"
-            echo
-            echo "-------------------------------------------------------"
-            echo "PR หลัก : https://github.com/storytold/craft-i18n/pull/340"
-            echo "คู่แข่ง   : https://github.com/storytold/craft-i18n/pull/213"
-            echo "ส่งอัตโนมัติจาก GitHub Actions (daily-digest.yml)"
-          } > mail.txt
-
-          cat mail.txt
-
-      - name: Send it
+      - name: Mail it only when there is something
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: rachatasawasdikit@gmail.com
         run: |
           set -euo pipefail
-          [ -n "${SMTP_USER:-}" ] && [ -n "${SMTP_PASS:-}" ] || { echo "SMTP secrets missing"; exit 1; }
+          if [ ! -s news.txt ]; then
+            echo "ไม่มีอะไรเกิดขึ้น — ไม่ส่งเมล"
+            exit 0
+          fi
+
+          today=$(TZ=Asia/Bangkok date '+%Y-%m-%d')
+          n=$(grep -c '^  •' news.txt || true)
+
+          {
+            echo "From: $SMTP_USER"
+            echo "To: $MAIL_TO"
+            echo "Subject: [craft-i18n TH] $today — มีอะไรเกิดขึ้น $n เรื่อง"
+            echo "Content-Type: text/plain; charset=UTF-8"
+            echo
+            echo "มีความเคลื่อนไหวเกี่ยวกับงานภาษาไทย craft-i18n"
+            echo
+            cat news.txt
+            echo
+            if [ -s quotes.txt ]; then
+              echo "─────────────────────"
+              echo "คอมเมนต์ล่าสุด"
+              echo "─────────────────────"
+              cat quotes.txt
+              echo
+            fi
+            echo "─────────────────────"
+            echo "PR หลัก: https://github.com/storytold/craft-i18n/pull/340"
+            echo "PR คู่แข่ง: https://github.com/storytold/craft-i18n/pull/213"
+            echo
+            echo "ถ้าวันไหนไม่มีอะไรเกิดขึ้น จะไม่มีเมลนี้"
+          } > mail.txt
+
+          cat mail.txt
           python3 - <<'PY'
           import os, smtplib, ssl
           from email.message import EmailMessage
@@ -165,5 +181,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pr-state
-          path: state.json
+          path: |
+            state.json
+            files.json
           retention-days: 30
