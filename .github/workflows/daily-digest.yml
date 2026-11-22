@@ -1,15 +1,14 @@
 name: Daily PR digest
 
-# Mails a summary of the Thai pull requests every morning from GitHub's servers,
+# Mails a Thai summary of the Thai pull requests every morning from GitHub's servers,
 # so the recipient's computer does not need to be on.
 #
 # Secrets (Settings → Secrets and variables → Actions):
-#   DIGEST_TOKEN  a token that may read pull requests (scope: repo). Optional:
-#                 without it the GITHUB_TOKEN below reads the public data instead.
-#   SMTP_USER     the Gmail address that sends (rachatasawasdikit@gmail.com)
-#   SMTP_PASS     that account's Google App Password
-# MAIL_TO is fixed in this file: rachatasawasdikit@gmail.com
+#   SMTP_USER  the Gmail address that sends (rachatasawasdikit@gmail.com)
+#   SMTP_PASS  that account's Google App Password
+# MAIL_TO is fixed below: rachatasawasdikit@gmail.com
 #
+# Yesterday's state is kept in the `pr-state` artifact, so the mail can say what changed.
 # The job only reads pull requests and sends one mail; it never writes to the repository.
 
 on:
@@ -27,69 +26,144 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Collect pull request state
+      - name: Yesterday's state (best effort)
+        id: yday
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          workflow: daily-digest.yml
+          name: pr-state
+          path: prev
+          if_no_artifact_found: ignore
+
+      - name: Collect the pull requests
         env:
-          TOKEN: ${{ secrets.DIGEST_TOKEN || secrets.GITHUB_TOKEN }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           api="https://api.github.com/repos/storytold/craft-i18n"
           auth=(-H "Authorization: token $TOKEN" -H "Accept: application/vnd.github+json" -H "User-Agent: daily-digest")
 
-          : > prs.txt
-          for n in 340 341 342 213; do
-            if ! json=$(curl -fsS "${auth[@]}" "$api/pulls/$n"); then
-              echo "#$n | could not be read (private data needs DIGEST_TOKEN)" >> prs.txt
-              continue
+          echo '[]' > state.json
+          for n in 340 341 342 213 180; do
+            if json=$(curl -fsS "${auth[@]}" "$api/pulls/$n"); then
+              printf '%s' "$json" | jq -c --argjson n "$n" \
+                '{n:$n, state:.state, merged:.merged, mergeable:.mergeable,
+                  author:.user.login, comments:.comments, updated:.updated_at, title:.title}' > one.json
+              jq -s 'add' state.json one.json > tmp.json && mv tmp.json state.json
             fi
-            printf '%s' "$json" | jq -r '"#\(.number) | \(.state) | merged=\(.merged) | mergeable=\(.mergeable) | by \(.user.login) | comments=\(.comments) | updated \(.updated_at)\n    \(.title)"' >> prs.txt
           done
 
+          # newest comments on the two PRs that matter
+          : > comments.txt
+          for n in 340 213; do
+            curl -fsS "${auth[@]}" "$api/issues/$n/comments?per_page=2&direction=desc" 2>/dev/null \
+              | jq -r --arg n "$n" '.[] | "#\($n) — \(.user.login) — \(.created_at[0:16] | sub("T"; " "))\n\(.body | split("\n") | map(select((length > 0) and (startswith("<!--") | not))) | .[0:5] | join("\n"))\n"' \
+              >> comments.txt || true
+          done
+
+          # are the Thai catalogs on main yet?
+          : > onmain.txt
           for f in locales/th/wordcraft.tsv locales/th/craft-launcher.tsv; do
             code=$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" "$api/contents/$f")
-            if [ "$code" = "200" ]; then
-              echo "$f is ON main" >> prs.txt
-            else
-              echo "$f is not on main yet (HTTP $code)" >> prs.txt
-            fi
+            if [ "$code" = "200" ]; then echo "  ✅ ${f#locales/th/} — อยู่บน main แล้ว" >> onmain.txt
+            else echo "  ⬜ ${f#locales/th/} — ยังไม่อยู่บน main" >> onmain.txt; fi
           done
 
-          echo "--- unread notifications ---" >> prs.txt
-          curl -fsS "${auth[@]}" "https://api.github.com/notifications" \
-            | jq -r '.[] | "[\(.reason)] \(.subject.title)"' >> prs.txt 2>/dev/null || echo "(none readable)" >> prs.txt
+      - name: Write the mail
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+        run: |
+          set -euo pipefail
+          today=$(TZ=Asia/Bangkok date '+%Y-%m-%d')
+          prev='prev/state.json'
 
-      - name: Send the mail
+          # what changed since yesterday (a PR absent from yesterday counts as changed)
+          jq -n --slurpfile now state.json --slurpfile prev "$prev" '
+            ($prev[0] // []) as $p
+            | ($now[0]) as $n
+            | [ $n[] | . as $x
+                | ($p | map(select(.n == $x.n)) | .[0]) as $o
+                | select($o == null
+                         or $o.state != $x.state
+                         or $o.merged != $x.merged
+                         or $o.mergeable != $x.mergeable
+                         or $o.comments != $x.comments)
+                | if $o == null
+                  then "  • #\($x.n) — ใหม่: \($x.state) · คู่แข่ง/PR เกี่ยวข้อง"
+                  else "  • #\($x.n) — \($o.state) → \($x.state) · mergeable \($o.mergeable) → \($x.mergeable) · คอมเมนต์ \($o.comments) → \($x.comments)"
+                  end ]
+          ' > changed.txt 2>/dev/null || echo "  (เทียบกับเมื่อวานไม่ได้)" > changed.txt
+
+          n_change=$(grep -c '^  •' changed.txt || true)
+          if [ "$n_change" -gt 0 ]; then
+            subject="[craft-i18n TH] $today — มีอะไรเกิดขึ้น ${n_change} เรื่อง"
+          else
+            subject="[craft-i18n TH] $today — ไม่มีอะไรใหม่"
+          fi
+
+          {
+            echo "Subject: $subject"
+            echo "Content-Type: text/plain; charset=UTF-8"
+            echo
+            echo "สรุปสถานะ PR ภาษาไทย craft-i18n — $today (เวลาไทย 06:30)"
+            echo
+            echo "======================================================="
+            if [ "$n_change" -gt 0 ]; then echo "★ มีอะไรเกิดขึ้นเมื่อวานนี้"; else echo "★ ไม่มีอะไรใหม่"; fi
+            echo "======================================================="
+            if [ "$n_change" -gt 0 ]; then cat changed.txt; else echo "  PR ยังนิ่งเหมือนเมื่อวาน ไม่มีคนตอบ ไม่มี merge"; fi
+            echo
+            echo "======================================================="
+            echo "■ สถานะปัจจุบัน"
+            echo "======================================================="
+            jq -r '.[] | "  #\(.n)  \(.state)\(if .merged then " ✅ merged" else "" end)  mergeable=\(.mergeable)  โดย \(.author)  คอมเมนต์=\(.comments)\n        \(.title)"' state.json
+            echo
+            echo "======================================================="
+            echo "■ แคตตาล็อกภาษาไทยบน main (storytold/craft-i18n)"
+            echo "======================================================="
+            cat onmain.txt
+            echo
+            echo "======================================================="
+            echo "■ คอมเมนต์ล่าสุด"
+            echo "======================================================="
+            head -c 3500 comments.txt 2>/dev/null || echo "  (ไม่มี)"
+            echo
+            echo "-------------------------------------------------------"
+            echo "PR หลัก : https://github.com/storytold/craft-i18n/pull/340"
+            echo "คู่แข่ง   : https://github.com/storytold/craft-i18n/pull/213"
+            echo "ส่งอัตโนมัติจาก GitHub Actions (daily-digest.yml)"
+          } > mail.txt
+
+          cat mail.txt
+
+      - name: Send it
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: rachatasawasdikit@gmail.com
         run: |
           set -euo pipefail
-          if [ -z "${SMTP_USER:-}" ] || [ -z "${SMTP_PASS:-}" ]; then
-            echo "SMTP_USER / SMTP_PASS are not set — add them as repository secrets." >&2
-            exit 1
-          fi
-          if [ -n "${SMTP_USER}" ] && [ "${SMTP_USER}" != "${MAIL_TO}" ]; then
-            echo "Note: SMTP_USER (${SMTP_USER}) differs from MAIL_TO (${MAIL_TO}); mail still goes to MAIL_TO."
-          fi
+          [ -n "${SMTP_USER:-}" ] && [ -n "${SMTP_PASS:-}" ] || { echo "SMTP secrets missing"; exit 1; }
           python3 - <<'PY'
           import os, smtplib, ssl
           from email.message import EmailMessage
 
-          state = open("prs.txt", encoding="utf-8").read()
+          head, _, body = open("mail.txt", encoding="utf-8").read().partition("\n\n")
+          subject = [l for l in head.splitlines() if l.startswith("Subject: ")][0][9:]
           msg = EmailMessage()
-          msg["Subject"] = "craft-i18n Thai PRs — daily digest"
+          msg["Subject"] = subject
           msg["From"] = os.environ["SMTP_USER"]
           msg["To"] = os.environ["MAIL_TO"]
-          msg.set_content(
-              "Thai localization status\n\n"
-              + state
-              + "\n\nLinks:\n"
-              + "  https://github.com/storytold/craft-i18n/pull/340\n"
-              + "  https://github.com/storytold/craft-i18n/pull/213\n"
-              + "\nSent by .github/workflows/daily-digest.yml\n"
-          )
+          msg.set_content(body)
           with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as s:
               s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
               s.send_message(msg)
-          print("mail sent to", os.environ["MAIL_TO"])
+          print("mail sent:", subject)
           PY
+
+      - name: Keep today's state for tomorrow
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-state
+          path: state.json
+          retention-days: 30
