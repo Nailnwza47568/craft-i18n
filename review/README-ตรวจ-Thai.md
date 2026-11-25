@@ -10,7 +10,6 @@
 | `WordCraft-TH-Review.xlsx` | **เริ่มจากไฟล์นี้** — ตารางคำแปล มีช่อง reviewer notes และช่อง Ver |
 | `wordcraft-th-review.tsv` | ไฟล์เดียวกันในรูป TSV (เปิดใน Excel/Sheets ได้, คั่นด้วย TAB) |
 | `locales/th/wordcraft.tsv` | ตัวแคตตาล็อกจริงที่จะส่งขึ้น craft-i18n (ผ่านตัวตรวจของ repo แล้ว) |
-| `locales/th/craft-launcher.tsv` | แคตตาล็อกภาษาไทยของ ArtCraft Launcher (87 รายการ) |
 
 ## วิธีตรวจ
 
@@ -41,6 +40,8 @@
   (ในเครื่องนี้รันผ่านแล้ว 17 + 3)
 
 ## หมายเหตุ
+
+- `wordcraft_feature_names` ใน repo ตรวจเฉพาะ locale ที่อยู่ใน `LOCALES` ซึ่ง**ยังไม่มี th** — `locales.rs` ตรวจแคตตาล็อกของทุก locale รวม th แล้ว
 
 แอปจะยังไม่แสดงตัวเลือกภาษาไทย จนกว่า WordCraft จะเพิ่ม `th` ในรายการภาษาเอง
 (`crates/ui-egui/src/i18n/mod.rs`) — ต้องขอทีม developer
